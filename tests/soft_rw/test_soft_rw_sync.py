@@ -153,6 +153,54 @@ def test_rejects_invalid_interval_relationship(
         )
 
 
+@pytest.mark.parametrize(
+    "lock_type",
+    [pytest.param(SoftReadWriteLock, id="sync"), pytest.param(AsyncSoftReadWriteLock, id="async")],
+)
+@pytest.mark.parametrize("cached", [pytest.param(False, id="new"), pytest.param(True, id="cached")])
+@pytest.mark.parametrize(
+    "timeout",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="infinity"),
+        pytest.param(float("-inf"), id="negative-infinity"),
+    ],
+)
+def test_rejects_non_finite_timeout(
+    tmp_path: Path,
+    lock_type: type[SoftReadWriteLock | AsyncSoftReadWriteLock],
+    cached: bool,
+    timeout: float,
+) -> None:
+    path: Final = tmp_path / "timing.lock"
+    # Keep the weakly cached instance alive through the second construction.
+    existing: Final = SoftReadWriteLock(path) if cached else None
+    try:
+        with pytest.raises(ValueError, match="timeout must be finite"):
+            lock_type(path, timeout=timeout)
+    finally:
+        if existing is not None:
+            existing.close()
+
+
+@pytest.mark.parametrize("mode", [pytest.param("read", id="read"), pytest.param("write", id="write")])
+@pytest.mark.parametrize(
+    "timeout",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="infinity"),
+        pytest.param(float("-inf"), id="negative-infinity"),
+    ],
+)
+def test_rejects_non_finite_acquire_timeout(lock: SoftReadWriteLock, mode: str, timeout: float) -> None:
+    acquire = lock.acquire_read if mode == "read" else lock.acquire_write
+    context = lock.read_lock if mode == "read" else lock.write_lock
+    with pytest.raises(ValueError, match="timeout must be finite"):
+        acquire(timeout)
+    with pytest.raises(ValueError, match="timeout must be finite"), context(timeout):
+        pass
+
+
 def test_public_attributes(lock_file: str) -> None:
     lock = SoftReadWriteLock(
         lock_file,

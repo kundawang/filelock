@@ -18,7 +18,7 @@ from filelock._async import (
     _wait_until_done,
 )
 
-from ._sync import SoftReadWriteLock
+from ._sync import SoftReadWriteLock, _validate_timeout
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
@@ -173,6 +173,7 @@ class AsyncSoftReadWriteLock:
 
         :returns: a proxy usable as an async context manager to release the lock
 
+        :raises ValueError: if *timeout* is not finite
         :raises RuntimeError: if the calling task already holds the write lock, if this instance was invalidated by
             :func:`os.fork`, or if :meth:`close` was called
         :raises Timeout: if the lock cannot be acquired within *timeout* seconds
@@ -196,6 +197,7 @@ class AsyncSoftReadWriteLock:
 
         :returns: a proxy usable as an async context manager to release the lock
 
+        :raises ValueError: if *timeout* is not finite
         :raises RuntimeError: if the calling task already holds the read lock, if this instance was invalidated by
             :func:`os.fork`, or if :meth:`close` was called
         :raises Timeout: if the lock cannot be acquired within *timeout* seconds
@@ -207,6 +209,8 @@ class AsyncSoftReadWriteLock:
 
     async def _acquire(self, mode: Literal["read", "write"], timeout: float | None, *, blocking: bool | None) -> None:
         blocking = self._lock.blocking if blocking is None else blocking
+        if timeout is not None:
+            _validate_timeout(timeout)
         sync_acquire = self._lock.acquire_read if mode == "read" else self._lock.acquire_write
 
         async def enter(remaining: float) -> None:

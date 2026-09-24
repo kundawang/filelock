@@ -53,6 +53,7 @@ class _SoftRWMeta(type):
         on_compromise: Callable[[LeaseCompromise], None] | None = None,
     ) -> SoftReadWriteLock:
         _ensure_current_process()
+        _validate_timeout(timeout)
         # Passed through only when set, so a subclass that declares its own constructor without it keeps working.
         extra = {} if on_compromise is None else {"on_compromise": on_compromise}
         if not is_singleton:
@@ -296,6 +297,7 @@ class SoftReadWriteLock(metaclass=_SoftRWMeta):
 
         :returns: a proxy that can be used as a context manager to release the lock
 
+        :raises ValueError: if *timeout* is not finite
         :raises RuntimeError: if a write lock is already held on this instance, if this instance was invalidated by
             :func:`os.fork`, or if :meth:`close` was called
         :raises Timeout: if the lock cannot be acquired within *timeout* seconds
@@ -325,6 +327,7 @@ class SoftReadWriteLock(metaclass=_SoftRWMeta):
 
         :returns: a proxy that can be used as a context manager to release the lock
 
+        :raises ValueError: if *timeout* is not finite
         :raises RuntimeError: if a read lock is already held, if a write lock is held by a different thread, if this
             instance was invalidated by :func:`os.fork`, or if :meth:`close` was called
         :raises Timeout: if the lock cannot be acquired within *timeout* seconds
@@ -419,6 +422,7 @@ class SoftReadWriteLock(metaclass=_SoftRWMeta):
             msg = f"SoftReadWriteLock on {self.lock_file} was invalidated by fork(); construct a new instance"
             raise RuntimeError(msg)
         timeout = self.timeout if timeout is None else timeout
+        _validate_timeout(timeout)
         blocking = self.blocking if blocking is None else blocking
 
         with self._locks.internal:
@@ -618,6 +622,14 @@ def _validate_intervals(heartbeat_interval: float, stale_threshold: float | None
         msg = f"poll_interval must be below stale_threshold ({stale_threshold}), got {poll_interval}"
         raise ValueError(msg)
     return stale_threshold
+
+
+def _validate_timeout(timeout: float) -> None:
+    # A nan deadline never compares less than the clock and an infinite one never arrives: both would wait forever
+    # while looking like an ordinary bounded acquire, so only finite values (and the -1 sentinel) are meaningful.
+    if not isfinite(timeout):
+        msg = f"timeout must be finite (-1 blocks indefinitely), got {timeout}"
+        raise ValueError(msg)
 
 
 @dataclass

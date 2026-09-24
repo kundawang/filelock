@@ -1,0 +1,3 @@
+:class:`~filelock.SoftReadWriteLock` and :class:`~filelock.AsyncSoftReadWriteLock` now reject a non-finite
+``timeout`` (``nan`` or infinity) with :class:`ValueError`, both at construction and per acquire call, instead of
+accepting it and then waiting forever or timing out unpredictably.
