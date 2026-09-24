@@ -53,6 +53,7 @@ class _SoftRWMeta(type):
         on_compromise: Callable[[LeaseCompromise], None] | None = None,
     ) -> SoftReadWriteLock:
         _ensure_current_process()
+        _validate_timeout(timeout)
         # Passed through only when set, so a subclass that declares its own constructor without it keeps working.
         extra = {} if on_compromise is None else {"on_compromise": on_compromise}
         if not is_singleton:
@@ -178,6 +179,7 @@ class SoftReadWriteLock(metaclass=_SoftRWMeta):
         on_compromise: Callable[[LeaseCompromise], None] | None = None,
     ) -> None:
         self._creator_pid = os.getpid()
+        _validate_timeout(timeout)
         stale_threshold = _validate_intervals(heartbeat_interval, stale_threshold, poll_interval)
 
         self.lock_file: str = os.fspath(lock_file)
@@ -420,6 +422,7 @@ class SoftReadWriteLock(metaclass=_SoftRWMeta):
             raise RuntimeError(msg)
         timeout = self.timeout if timeout is None else timeout
         blocking = self.blocking if blocking is None else blocking
+        _validate_timeout(timeout)
 
         with self._locks.internal:
             if self._closed:
@@ -618,6 +621,12 @@ def _validate_intervals(heartbeat_interval: float, stale_threshold: float | None
         msg = f"poll_interval must be below stale_threshold ({stale_threshold}), got {poll_interval}"
         raise ValueError(msg)
     return stale_threshold
+
+
+def _validate_timeout(timeout: float) -> None:
+    if not isfinite(timeout):
+        msg = f"timeout must be finite; use -1 to block indefinitely, got {timeout!r}"
+        raise ValueError(msg)
 
 
 @dataclass

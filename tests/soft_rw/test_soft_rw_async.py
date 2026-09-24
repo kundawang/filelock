@@ -126,6 +126,27 @@ async def test_async_exposes_configuration(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [pytest.param("read", id="read"), pytest.param("write", id="write")])
+@pytest.mark.parametrize(
+    "timeout",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="infinity"),
+        pytest.param(float("-inf"), id="negative-infinity"),
+    ],
+)
+async def test_async_rejects_non_finite_acquire_timeout(
+    tmp_path: Path, mode: Literal["read", "write"], timeout: float
+) -> None:
+    lock = _make(tmp_path)
+    try:
+        with pytest.raises(ValueError, match="timeout must be finite; use -1"):
+            await getattr(lock, f"acquire_{mode}")(timeout)
+    finally:
+        await lock.close()
+
+
+@pytest.mark.asyncio
 async def test_async_raw_acquire_release_round_trip(tmp_path: Path) -> None:
     lock = _make(tmp_path)
     try:

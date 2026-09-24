@@ -153,6 +153,53 @@ def test_rejects_invalid_interval_relationship(
         )
 
 
+@pytest.mark.parametrize(
+    "lock_type",
+    [pytest.param(SoftReadWriteLock, id="sync"), pytest.param(AsyncSoftReadWriteLock, id="async")],
+)
+@pytest.mark.parametrize("cached", [pytest.param(False, id="new"), pytest.param(True, id="cached")])
+@pytest.mark.parametrize(
+    "timeout",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="infinity"),
+        pytest.param(float("-inf"), id="negative-infinity"),
+    ],
+)
+def test_rejects_non_finite_constructor_timeout(
+    tmp_path: Path,
+    lock_type: type[SoftReadWriteLock | AsyncSoftReadWriteLock],
+    cached: bool,
+    timeout: float,
+) -> None:
+    path = tmp_path / "timeout.lock"
+    existing = SoftReadWriteLock(path) if cached else None
+    try:
+        with pytest.raises(ValueError, match="timeout must be finite; use -1"):
+            lock_type(path, timeout=timeout)
+    finally:
+        if existing is not None:
+            existing.close()
+
+
+@pytest.mark.parametrize("mode", [pytest.param("read", id="read"), pytest.param("write", id="write")])
+@pytest.mark.parametrize(
+    "timeout",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="infinity"),
+        pytest.param(float("-inf"), id="negative-infinity"),
+    ],
+)
+def test_rejects_non_finite_acquire_timeout(lock_file: str, mode: Literal["read", "write"], timeout: float) -> None:
+    lock = SoftReadWriteLock(lock_file, is_singleton=False)
+    try:
+        with pytest.raises(ValueError, match="timeout must be finite; use -1"):
+            getattr(lock, f"acquire_{mode}")(timeout)
+    finally:
+        lock.close()
+
+
 def test_public_attributes(lock_file: str) -> None:
     lock = SoftReadWriteLock(
         lock_file,

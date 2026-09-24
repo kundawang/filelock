@@ -18,7 +18,7 @@ from filelock._async import (
     _wait_until_done,
 )
 
-from ._sync import SoftReadWriteLock
+from ._sync import SoftReadWriteLock, _validate_timeout
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
@@ -206,6 +206,7 @@ class AsyncSoftReadWriteLock:
         return AsyncAcquireSoftReadWriteReturnProxy(lock=self)
 
     async def _acquire(self, mode: Literal["read", "write"], timeout: float | None, *, blocking: bool | None) -> None:
+        _validate_timeout(self._lock.timeout if timeout is None else timeout)
         blocking = self._lock.blocking if blocking is None else blocking
         sync_acquire = self._lock.acquire_read if mode == "read" else self._lock.acquire_write
 
