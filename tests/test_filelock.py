@@ -539,11 +539,6 @@ def test_default_poll_interval(lock_type: type[BaseFileLock], tmp_path: Path) ->
     lock_2.poll_interval = 0.2
     assert lock_2.poll_interval == pytest.approx(0.2)
 
-    lock_3 = lock_type(str(lock_path), poll_interval=0)
-    assert lock_3.poll_interval == 0
-    lock_3.poll_interval = 0.0
-    assert lock_3.poll_interval == pytest.approx(0.0)
-
 
 @pytest.mark.parametrize("lock_type", [FileLock, SoftFileLock])
 def test_poll_interval_used_by_context_manager(
@@ -601,11 +596,13 @@ def _set_poll_interval(
 @pytest.mark.parametrize(
     ("bad_value", "error_type", "message"),
     [
-        pytest.param(-1, ValueError, "finite and non-negative", id="negative-int"),
-        pytest.param(-0.5, ValueError, "finite and non-negative", id="negative-float"),
-        pytest.param(float("nan"), ValueError, "finite and non-negative", id="nan"),
-        pytest.param(float("inf"), ValueError, "finite and non-negative", id="positive-infinity"),
-        pytest.param(float("-inf"), ValueError, "finite and non-negative", id="negative-infinity"),
+        pytest.param(-1, ValueError, "finite and greater than 0", id="negative-int"),
+        pytest.param(-0.5, ValueError, "finite and greater than 0", id="negative-float"),
+        pytest.param(0, ValueError, "finite and greater than 0", id="zero-int"),
+        pytest.param(0.0, ValueError, "finite and greater than 0", id="zero-float"),
+        pytest.param(float("nan"), ValueError, "finite and greater than 0", id="nan"),
+        pytest.param(float("inf"), ValueError, "finite and greater than 0", id="positive-infinity"),
+        pytest.param(float("-inf"), ValueError, "finite and greater than 0", id="negative-infinity"),
         pytest.param(True, TypeError, "poll_interval must be", id="true"),
         pytest.param(False, TypeError, "poll_interval must be", id="false"),
         pytest.param("5", TypeError, "poll_interval must be", id="string"),

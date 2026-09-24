@@ -539,10 +539,10 @@ def _resolve_lifetime(lifetime: float | None, cls: type[BaseFileLock], *, stackl
 def _resolve_poll_interval(poll_interval: float) -> float:
     """Validate ``poll_interval`` used for ``time.sleep`` / ``asyncio.sleep`` retries."""
     if isinstance(poll_interval, bool) or not isinstance(poll_interval, (int, float)):
-        msg = f"poll_interval must be a finite non-negative number, not {type(poll_interval).__name__}"
+        msg = f"poll_interval must be a finite positive number, not {type(poll_interval).__name__}"
         raise TypeError(msg)
-    if poll_interval < 0 or (isinstance(poll_interval, float) and not math.isfinite(poll_interval)):
-        msg = f"poll_interval must be finite and non-negative, not {poll_interval!r}"
+    if poll_interval <= 0 or (isinstance(poll_interval, float) and not math.isfinite(poll_interval)):
+        msg = f"poll_interval must be finite and greater than 0, not {poll_interval!r}"
         raise ValueError(msg)
     return float(poll_interval)
 
@@ -887,7 +887,7 @@ class BaseFileLock(contextlib.ContextDecorator, metaclass=FileLockMeta):  # ruff
 
         :param value: the new value, in seconds
 
-        :raises ValueError: if *value* is negative or not finite
+        :raises ValueError: if *value* is not positive or not finite
         :raises TypeError: if *value* is not a real number
 
         """
