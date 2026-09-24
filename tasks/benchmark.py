@@ -92,7 +92,7 @@ def _uncontended(root: Path) -> list[Sample]:
 
 
 def _timeout_cpu(root: Path) -> Sample:
-    # A contended acquire with a zero poll interval should spin on the clock, not the CPU. Hold the lock, time out a
+    # A contended acquire with a tiny poll interval should spin on the clock, not the CPU. Hold the lock, time out a
     # second acquirer, and report the CPU time the wait burned; a busy loop would show wall-sized CPU here.
     holder = FileLock(str(root / "timeout.lock"))
     holder.acquire()
@@ -100,11 +100,11 @@ def _timeout_cpu(root: Path) -> Sample:
     try:
         started = time.process_time()
         with suppress(filelock.Timeout):
-            waiter.acquire(timeout=0.25, poll_interval=0.0)
+            waiter.acquire(timeout=0.25, poll_interval=0.001)
         cpu = time.process_time() - started
     finally:
         holder.release()
-    return Sample("timeout cpu (0.25s wall, poll=0)", cpu * 1e3, cpu * 1e3, "ms cpu")
+    return Sample("timeout cpu (0.25s wall, poll=1ms)", cpu * 1e3, cpu * 1e3, "ms cpu")
 
 
 def _descriptor_growth(root: Path) -> Sample:

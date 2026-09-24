@@ -184,11 +184,13 @@ async def _set_poll_interval(
 @pytest.mark.parametrize(
     ("bad_value", "error_type", "message"),
     [
-        pytest.param(-1, ValueError, "finite and non-negative", id="negative-int"),
-        pytest.param(-0.5, ValueError, "finite and non-negative", id="negative-float"),
-        pytest.param(float("nan"), ValueError, "finite and non-negative", id="nan"),
-        pytest.param(float("inf"), ValueError, "finite and non-negative", id="positive-infinity"),
-        pytest.param(float("-inf"), ValueError, "finite and non-negative", id="negative-infinity"),
+        pytest.param(-1, ValueError, "finite and positive", id="negative-int"),
+        pytest.param(-0.5, ValueError, "finite and positive", id="negative-float"),
+        pytest.param(0, ValueError, "finite and positive", id="zero-int"),
+        pytest.param(0.0, ValueError, "finite and positive", id="zero-float"),
+        pytest.param(float("nan"), ValueError, "finite and positive", id="nan"),
+        pytest.param(float("inf"), ValueError, "finite and positive", id="positive-infinity"),
+        pytest.param(float("-inf"), ValueError, "finite and positive", id="negative-infinity"),
         pytest.param(True, TypeError, "poll_interval must be", id="true"),
         pytest.param(False, TypeError, "poll_interval must be", id="false"),
         pytest.param("5", TypeError, "poll_interval must be", id="string"),

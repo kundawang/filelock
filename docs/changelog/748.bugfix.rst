@@ -1,0 +1,2 @@
+``poll_interval=0`` now raises :class:`ValueError` at construction, on the setter, and on ``acquire()`` instead of
+busy-spinning in the retry loop; the interval must be a finite positive number. :pr:`748`
