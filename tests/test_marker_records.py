@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 from typing import TYPE_CHECKING
 
@@ -8,7 +9,7 @@ import pytest
 
 from filelock import SoftFileLease, Timeout
 from filelock._identity import process_start_token
-from filelock._marker import OwnerRecord, encode_marker
+from filelock._marker import OwnerRecord, encode_marker, expressible_lease_duration, parse_marker
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -53,6 +54,37 @@ def test_encode_marker_omits_absent_lease_fields() -> None:
     assert rendered == b"filelock/2\npid=7\nhost=h\nmode=unknown\n"
     assert b"token=" not in rendered
     assert b"duration=" not in rendered
+
+
+@pytest.mark.parametrize(
+    ("duration", "expressible"),
+    [
+        pytest.param(30, True, id="small-integer"),
+        pytest.param(0.1, True, id="inexact-decimal-float"),
+        pytest.param(2**53, True, id="largest-exact-consecutive-integer"),
+        pytest.param(2**53 + 1, False, id="first-inexact-integer"),
+        pytest.param(2**1023, True, id="largest-exact-power-of-two"),
+        pytest.param(10**400, False, id="integer-beyond-float"),
+        pytest.param(sys.float_info.max, True, id="largest-finite-float"),
+    ],
+)
+def test_expressible_lease_duration_bounds(duration: float, expressible: bool) -> None:
+    assert expressible_lease_duration(duration) is expressible
+
+
+def test_marker_records_the_largest_exact_integer_duration() -> None:
+    record = OwnerRecord(
+        pid=1,
+        hostname="h",
+        mode="lease",
+        token="t",  # ruff:ignore[hardcoded-password-func-arg]  # a marker field, not a credential
+        lease_duration=2**53,
+    )
+
+    parsed = parse_marker(encode_marker(record).decode())
+
+    assert parsed is not None
+    assert parsed.lease_duration == 2**53
 
 
 def test_record_start_token_reads_back(tmp_path: Path) -> None:

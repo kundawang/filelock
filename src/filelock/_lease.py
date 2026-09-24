@@ -7,11 +7,11 @@ from contextlib import suppress
 from dataclasses import dataclass
 from math import isfinite
 from threading import Event, Thread, current_thread, local
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Final, Literal
 
 from ._error import LeaseSettingsMismatch
 from ._identity import owner_is_stale
-from ._marker import MarkerSoftFileLock, OwnerMode, OwnerRecord, parse_marker
+from ._marker import MarkerSoftFileLock, OwnerMode, OwnerRecord, expressible_lease_duration, parse_marker
 from ._soft import _read_lock_file
 from ._util import break_lock_file, touch
 
@@ -31,6 +31,10 @@ if TYPE_CHECKING:
 CompromiseReason = Literal["marker-missing", "owner-changed", "refresh-failed", "evicted"]
 
 _RefreshOutcome = Literal["ok", "lost", "transient"]
+
+#: How much of a rejected ``lease_duration`` repr the error message shows before an ellipsis; a huge integer's
+#: digits would otherwise drown the reason.
+_MAX_DURATION_REPR_SHOWN: Final[int] = 32
 
 
 @dataclass(frozen=True)
@@ -124,7 +128,8 @@ class SoftFileLease(MarkerSoftFileLock):
         Create a lease.
 
         :param lease_duration: seconds of marker staleness after which a contender may take the claim. Every contender
-            for the path must pass the same value.
+            for the path must pass the same value. The marker records the duration as a float, so an integer beyond
+            float's exact range is rejected rather than published as a claim no peer reads back the same.
         :param heartbeat_interval: seconds between refreshes. Defaults to a third of ``lease_duration``, leaving room
             for two missed refreshes before a peer may take the claim. Must be shorter than ``lease_duration``.
         :param on_compromise: called from the heartbeat thread with a :class:`LeaseCompromise` when the claim is lost.
@@ -137,8 +142,19 @@ class SoftFileLease(MarkerSoftFileLock):
         if isinstance(lease_duration, bool) or not isinstance(lease_duration, (int, float)):
             msg = f"lease_duration must be a finite positive number, not {type(lease_duration).__name__}"
             raise TypeError(msg)
-        if not isfinite(lease_duration) or lease_duration <= 0:
+        # isfinite converts to float, which overflows on an int beyond float's range; every int is finite, and the
+        # expressibility check below bounds its magnitude.
+        finite = True if isinstance(lease_duration, int) else isfinite(lease_duration)
+        if not finite or lease_duration <= 0:
             msg = f"lease_duration must be positive and finite, got {lease_duration!r}"
+            raise ValueError(msg)
+        if not expressible_lease_duration(lease_duration):
+            # A duration that fails this is an integer beyond float's exact range; one with thousands of digits would
+            # drown the message, so show its leading digits only.
+            shown = repr(lease_duration)
+            if len(shown) > _MAX_DURATION_REPR_SHOWN:
+                shown = f"{shown[:_MAX_DURATION_REPR_SHOWN]}..."
+            msg = f"lease_duration must be exactly representable as a float for the marker to record it, got {shown}"
             raise ValueError(msg)
         if heartbeat_interval is None:
             heartbeat_interval = lease_duration / 3

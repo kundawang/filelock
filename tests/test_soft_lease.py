@@ -3,6 +3,7 @@ from __future__ import annotations
 import itertools
 import os
 import socket
+import sys
 import time
 from contextlib import suppress
 from errno import EIO, ENOENT
@@ -415,6 +416,8 @@ def test_lease_does_not_expire_a_strict_holder(marker: Path) -> None:  # pragma:
         pytest.param(float("-inf"), _HEARTBEAT, ValueError, "positive and finite", id="negative-infinite-duration"),
         pytest.param(True, None, TypeError, "number, not bool", id="true-duration"),
         pytest.param(False, None, TypeError, "number, not bool", id="false-duration"),
+        pytest.param(2**53 + 1, None, ValueError, "exactly representable", id="inexact-integer-duration"),
+        pytest.param(10**400, None, ValueError, "exactly representable", id="duration-beyond-float"),
         pytest.param(_DURATION, 0, ValueError, "heartbeat_interval must be positive", id="zero-heartbeat"),
         pytest.param(_DURATION, _DURATION, ValueError, "below lease_duration", id="heartbeat-equals-duration"),
         pytest.param(_DURATION, _DURATION * 2, ValueError, "below lease_duration", id="heartbeat-over-duration"),
@@ -429,6 +432,39 @@ def test_lease_rejects_incoherent_settings(
 ) -> None:
     with pytest.raises(error, match=message):
         SoftFileLease(str(marker), lease_duration=lease_duration, heartbeat_interval=heartbeat_interval)
+
+
+@pytest.mark.parametrize(
+    "lease_duration",
+    [
+        pytest.param(2**53, id="largest-exact-consecutive-integer"),
+        pytest.param(2**1023, id="largest-exact-power-of-two"),
+        pytest.param(sys.float_info.max, id="largest-finite-float"),
+    ],
+)
+def test_lease_records_the_largest_expressible_durations(marker: Path, lease_duration: float) -> None:
+    # An explicit heartbeat: the default of duration/3 overflows the platform's thread-wait ceiling at these sizes.
+    lease = SoftFileLease(str(marker), lease_duration=lease_duration, heartbeat_interval=_HEARTBEAT)
+
+    with lease:
+        owner = lease.owner
+        assert owner is not None
+        assert owner.lease_duration == lease_duration
+
+
+def test_lease_rejects_a_duration_beyond_the_marker_without_dumping_it(marker: Path) -> None:
+    # 10**2000 reprs to two thousand digits; the rejection must name the problem, not recite the integer.
+    with pytest.raises(ValueError, match="exactly representable") as exc_info:
+        SoftFileLease(str(marker), lease_duration=10**2000)
+
+    assert len(str(exc_info.value)) < 160
+
+
+def test_lease_peers_agree_on_the_largest_exact_integer_duration(marker: Path) -> None:
+    # 2**53 is the largest consecutive integer float records exactly: a peer must read the same duration the holder
+    # configured, not raise LeaseSettingsMismatch against an identical configuration.
+    with _lease(marker, lease_duration=2**53), pytest.raises(Timeout):
+        _lease(marker, lease_duration=2**53).acquire()
 
 
 def test_lease_defaults_the_heartbeat_below_the_duration(marker: Path) -> None:

@@ -120,6 +120,17 @@ def parse_marker(content: str | None) -> OwnerRecord | None:
     return _build_record(fields)
 
 
+def expressible_lease_duration(duration: float) -> bool:
+    """
+    Whether a protocol 2 marker records a lease duration exactly as configured.
+
+    The marker writes the duration as its ``repr`` and reads it back with ``float``, so a value survives only when it
+    equals its own float round-trip. Every float qualifies; an integer qualifies only while ``float`` represents it
+    exactly, which also bounds its digits far below the marker size cap a larger integer would overflow.
+    """
+    return float(repr(duration)) == duration  # ruff:ignore[float-equality-comparison]  # bit-exact round-trip is the check
+
+
 def _build_record(fields: dict[str, str]) -> OwnerRecord | None:
     # An unknown key is a field a newer filelock published, so ignore it rather than read the record as malformed. An
     # unrecognized mode is the same story one level up: a contract this version does not implement. Reading it as
@@ -153,5 +164,6 @@ __all__ = [
     "OwnerMode",
     "OwnerRecord",
     "encode_marker",
+    "expressible_lease_duration",
     "parse_marker",
 ]
