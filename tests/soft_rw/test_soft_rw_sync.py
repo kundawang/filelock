@@ -472,6 +472,84 @@ def test_transaction_lock_timeout_across_threads(lock_file: str) -> None:
         peer.close()
 
 
+@pytest.mark.timeout(_PROCESS_DEADLINE * 2)
+@pytest.mark.parametrize("mode", [pytest.param("read", id="read"), pytest.param("write", id="write")])
+@pytest.mark.parametrize("blocking", [pytest.param(True, id="blocking"), pytest.param(False, id="nonblocking")])
+def test_internal_state_lock_contention_obeys_timeout(
+    lock_file: str, mode: Literal["read", "write"], *, blocking: bool
+) -> None:
+    # A peer thread parked on the internal state lock must not make an acquisition wait past its own timeout:
+    # the contender gets a readable Timeout instead of waiting on the state lock forever.
+    lock = _make_lock(lock_file)
+    errors: list[Timeout] = []
+    lock._locks.internal.acquire()
+    try:
+
+        def contender() -> None:
+            acquire = lock.acquire_read if mode == "read" else lock.acquire_write
+            try:
+                acquire(timeout=0.2, blocking=blocking)
+            except Timeout as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=contender)
+        thread.start()
+        thread.join(timeout=_PROCESS_DEADLINE)
+        assert not thread.is_alive()  # before the fix the contender waited on the state lock for good
+    finally:
+        lock._locks.internal.release()
+    try:
+        assert len(errors) == 1
+        assert errors[0].lock_file == lock_file
+        assert str(errors[0]) == f"The file lock '{lock_file}' could not be acquired."
+        # The timed-out attempt left no claim behind: the instance still acquires and releases cleanly.
+        with lock.read_lock(timeout=2) if mode == "read" else lock.write_lock(timeout=2):
+            pass
+        assert _holders(lock_file) == []
+    finally:
+        lock.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(_PROCESS_DEADLINE * 2)
+async def test_async_internal_state_lock_contention_obeys_timeout(lock_file: str) -> None:
+    lock: Final = AsyncSoftReadWriteLock(
+        lock_file, is_singleton=False, heartbeat_interval=0.1, stale_threshold=10, poll_interval=0.02
+    )
+    try:
+        lock._lock._locks.internal.acquire()
+        try:
+            with pytest.raises(Timeout) as caught:
+                await lock.acquire_read(timeout=0.2)
+        finally:
+            lock._lock._locks.internal.release()
+        assert caught.value.lock_file == lock_file
+    finally:
+        await lock.close()
+
+
+@pytest.mark.timeout(_PROCESS_DEADLINE * 2)
+def test_internal_state_lock_contention_waits_for_release(lock_file: str) -> None:
+    # With no deadline (timeout=-1) an acquisition waits out a peer holding the internal state lock, then proceeds.
+    lock = _make_lock(lock_file)
+    acquired = threading.Event()
+    lock._locks.internal.acquire()
+
+    def contender() -> None:
+        lock.acquire_read(timeout=-1)
+        acquired.set()
+
+    thread = threading.Thread(target=contender)
+    thread.start()
+    try:
+        assert not acquired.wait(timeout=0.2)
+        lock._locks.internal.release()
+        assert acquired.wait(timeout=_PROCESS_DEADLINE)
+    finally:
+        thread.join(timeout=_PROCESS_DEADLINE)
+        lock.close()
+
+
 @pytest.mark.timeout(_PROCESS_DEADLINE * 3)
 def test_two_readers_in_same_process_share_slot(lock_file: str) -> None:
     # Many threads take a read lock on one instance; one hits the inner reentrant branch (lock level
