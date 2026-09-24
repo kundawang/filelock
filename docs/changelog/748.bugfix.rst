@@ -1,0 +1,5 @@
+:class:`~filelock.SoftFileLease` now validates ``lease_duration`` against the range the marker can express: a
+duration larger than ``sys.float_info.max`` raises a readable :class:`ValueError` at construction instead of a raw
+:exc:`OverflowError`, and an integer duration is normalized to the float the marker publishes, so two contenders
+configured with the same large integer no longer raise :class:`~filelock.LeaseSettingsMismatch` against each
+other. :pr:`748`

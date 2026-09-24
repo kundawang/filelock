@@ -3,6 +3,7 @@ from __future__ import annotations
 import itertools
 import os
 import socket
+import sys
 import time
 from contextlib import suppress
 from errno import EIO, ENOENT
@@ -413,6 +414,7 @@ def test_lease_does_not_expire_a_strict_holder(marker: Path) -> None:  # pragma:
         pytest.param(float("nan"), _HEARTBEAT, ValueError, "positive and finite", id="nan-duration"),
         pytest.param(float("inf"), _HEARTBEAT, ValueError, "positive and finite", id="infinite-duration"),
         pytest.param(float("-inf"), _HEARTBEAT, ValueError, "positive and finite", id="negative-infinite-duration"),
+        pytest.param(10**400, None, ValueError, "for the marker to express it", id="duration-beyond-marker-range"),
         pytest.param(True, None, TypeError, "number, not bool", id="true-duration"),
         pytest.param(False, None, TypeError, "number, not bool", id="false-duration"),
         pytest.param(_DURATION, 0, ValueError, "heartbeat_interval must be positive", id="zero-heartbeat"),
@@ -435,6 +437,26 @@ def test_lease_defaults_the_heartbeat_below_the_duration(marker: Path) -> None:
     lease = SoftFileLease(str(marker), lease_duration=30)
 
     assert lease.lease_duration == 30
+
+
+def test_lease_accepts_the_largest_duration_the_marker_expresses(marker: Path) -> None:
+    with SoftFileLease(
+        str(marker), lease_duration=sys.float_info.max, heartbeat_interval=_HEARTBEAT, timeout=0.1
+    ) as lease:
+        owner = lease.owner
+        assert owner is not None
+        assert owner.lease_duration == sys.float_info.max
+
+
+def test_lease_normalizes_an_int_duration_to_the_float_the_marker_publishes(marker: Path) -> None:
+    # 10**25 has no exact float, so the marker publishes the nearest one; storing that same float keeps two
+    # identically configured contenders in agreement instead of mismatching on the int's exact value.
+    holder = SoftFileLease(str(marker), lease_duration=10**25, heartbeat_interval=_HEARTBEAT, timeout=0.1)
+    with holder:
+        assert (holder.lease_duration,) == (float(10**25),)
+        peer = SoftFileLease(str(marker), lease_duration=10**25, heartbeat_interval=_HEARTBEAT, timeout=0.1)
+        with pytest.raises(Timeout):
+            peer.acquire()
 
 
 def test_lease_drops_lifetime_with_a_warning(marker: Path) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import sys
 import time
 from contextlib import suppress
 from dataclasses import dataclass
@@ -16,7 +17,6 @@ from ._soft import _read_lock_file
 from ._util import break_lock_file, touch
 
 if TYPE_CHECKING:
-    import sys
     from collections.abc import Callable
 
     from ._api import LockOptions
@@ -124,7 +124,8 @@ class SoftFileLease(MarkerSoftFileLock):
         Create a lease.
 
         :param lease_duration: seconds of marker staleness after which a contender may take the claim. Every contender
-            for the path must pass the same value.
+            for the path must pass the same value. Must be at most ``sys.float_info.max``, the largest duration the
+            marker can express.
         :param heartbeat_interval: seconds between refreshes. Defaults to a third of ``lease_duration``, leaving room
             for two missed refreshes before a peer may take the claim. Must be shorter than ``lease_duration``.
         :param on_compromise: called from the heartbeat thread with a :class:`LeaseCompromise` when the claim is lost.
@@ -137,7 +138,18 @@ class SoftFileLease(MarkerSoftFileLock):
         if isinstance(lease_duration, bool) or not isinstance(lease_duration, (int, float)):
             msg = f"lease_duration must be a finite positive number, not {type(lease_duration).__name__}"
             raise TypeError(msg)
-        if not isfinite(lease_duration) or lease_duration <= 0:
+        if lease_duration <= 0:
+            msg = f"lease_duration must be positive and finite, got {lease_duration!r}"
+            raise ValueError(msg)
+        try:
+            # The marker publishes the duration as a float, so normalize to one here: a peer configured with the
+            # same value then agrees on it bit for bit, and an int beyond float range is rejected instead of
+            # publishing a marker no reader can parse.
+            lease_duration = float(lease_duration)
+        except OverflowError:
+            msg = f"lease_duration must be at most {sys.float_info.max} for the marker to express it"
+            raise ValueError(msg) from None
+        if not isfinite(lease_duration):
             msg = f"lease_duration must be positive and finite, got {lease_duration!r}"
             raise ValueError(msg)
         if heartbeat_interval is None:
