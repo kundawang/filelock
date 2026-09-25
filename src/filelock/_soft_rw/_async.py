@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Literal, ParamSpec, TypeVar
 
 from filelock._async import (
+    _BACKEND_COMMITTED_ATTR,
     _BackendOutcome,
     _capture_call,
     _drain_future,
@@ -278,6 +279,9 @@ class AsyncSoftReadWriteLock:
                 await _drain_future(future)
             except BaseException as error:  # ruff:ignore[blind-except]  # reported with the cancellation below
                 _raise_cancelled_error(cancellation, error)
+            # The drained backend call committed, so tell the ownership bookkeeping this cancellation is
+            # not a backend CancelledError (where the call never ran and the hold must be kept).
+            setattr(cancellation, _BACKEND_COMMITTED_ATTR, True)
             raise
         return _future_result(future)
 

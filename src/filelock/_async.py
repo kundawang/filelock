@@ -27,6 +27,11 @@ class _AsyncTransitionUnavailableError(Exception):
     pass
 
 
+#: Set on a caller cancellation re-raised after the drained backend call committed, so ownership bookkeeping can tell
+#: it apart from a backend CancelledError, where the backend call never ran to completion.
+_BACKEND_COMMITTED_ATTR: Final[str] = "_filelock_backend_committed"
+
+
 @dataclass(frozen=True)
 class _BackendOutcome(Generic[_T]):
     value: _T | None = None
@@ -217,6 +222,18 @@ class _TaskOwners:
             mode = self._mode
         try:
             await leave()
+        except asyncio.CancelledError as cancellation:
+            if getattr(cancellation, _BACKEND_COMMITTED_ATTR, False):
+                # The wrapper drained the executor call before re-raising caller cancellation, so the
+                # backend release already committed. Record the release instead of resurrecting a hold
+                # nobody owns: a restored hold would block new acquirers behind a dead task, and its
+                # retried release would free a later owner's claim.
+                self._finish_transition(mode=None)
+            else:
+                # A backend CancelledError (the executor dropped the queued release) left the sync lock
+                # held, so keep the hold for a retried release to find.
+                self._finish_transition(mode=mode, holder=task)
+            raise
         except BaseException:
             # The sync lock may still hold the transaction, so keep the hold for a retried release to find.
             self._finish_transition(mode=mode, holder=task)
@@ -313,6 +330,7 @@ async def _capture_awaitable(awaitable: Awaitable[_T]) -> _BackendOutcome[_T]:
 
 
 __all__ = [
+    "_BACKEND_COMMITTED_ATTR",
     "_AsyncTransitionGate",
     "_AsyncTransitionUnavailableError",
     "_BackendOutcome",

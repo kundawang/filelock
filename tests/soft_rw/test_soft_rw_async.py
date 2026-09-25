@@ -343,6 +343,25 @@ async def test_async_release_cancellation_drains_the_release(tmp_path: Path, moc
 
 @pytest.mark.asyncio
 @XFAIL_WITHOUT_COROUTINE_CANCELLATION
+async def test_async_release_cancellation_leaves_no_stale_hold(tmp_path: Path, mocker: MockerFixture) -> None:
+    lock = _make(tmp_path)
+    gate = _Gate(mocker, "release")
+    task = asyncio.create_task(_acquire_write_then_release(lock))
+    await gate.started.wait()
+    task.cancel("cancel release")
+    asyncio.get_running_loop().call_later(0.05, gate.resume)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert gate.finished.is_set()
+    # The committed release leaves no stale task hold, so the next acquirer is admitted immediately.
+    await lock.acquire_write(timeout=5)
+    await lock.release()
+    await lock.close()
+
+
+@pytest.mark.asyncio
+@XFAIL_WITHOUT_COROUTINE_CANCELLATION
 async def test_async_release_cancellation_surfaces_a_failed_release(tmp_path: Path, mocker: MockerFixture) -> None:
     lock = _make(tmp_path)
     release_error = RuntimeError("release failed")

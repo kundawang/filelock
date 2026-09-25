@@ -341,6 +341,152 @@ async def test_context_cancellation_preserves_body_and_rollback_contexts(
     assert_read_write_lock_state(lock_file, probe_mode, available=True)
 
 
+@pytest.mark.parametrize("mode", [pytest.param("read", id="read"), pytest.param("write", id="write")])
+@pytest.mark.asyncio
+async def test_release_cancellation_commits_the_release(lock_file: str, mocker: MockerFixture, mode: str) -> None:
+    rollback_started = asyncio.Event()
+    finish_rollback = threading.Event()
+    _patch_async_rollback(mocker, asyncio.get_running_loop(), rollback_started, finish_rollback)
+    lock = AsyncReadWriteLock(lock_file, is_singleton=False)
+
+    async def hold_then_release() -> None:
+        await (lock.acquire_read if mode == "read" else lock.acquire_write)()
+        await lock.release()
+
+    task = asyncio.create_task(hold_then_release())
+    await rollback_started.wait()
+    task.cancel("cancel release")
+    finish_rollback.set()
+    with pytest.raises(asyncio.CancelledError) as info:
+        await task
+    assert_cancellation_message(info.value, "cancel release")
+    # The drained backend release committed, so no stale hold may block the next acquirer or free its claim.
+    assert_read_write_lock_state(lock_file, "write" if mode == "read" else "read", available=True)
+    await lock.acquire_write()
+    await lock.release()
+    with pytest.raises(RuntimeError, match="not held"):
+        await lock.release()
+    await lock.close()
+
+
+@pytest.mark.asyncio
+async def test_release_repeated_cancellation_commits_the_release(lock_file: str, mocker: MockerFixture) -> None:
+    rollback_started = asyncio.Event()
+    finish_rollback = threading.Event()
+    _patch_async_rollback(mocker, asyncio.get_running_loop(), rollback_started, finish_rollback)
+    lock = AsyncReadWriteLock(lock_file, is_singleton=False)
+
+    async def hold_then_release() -> None:
+        await lock.acquire_write()
+        await lock.release()
+
+    task = asyncio.create_task(hold_then_release())
+    await rollback_started.wait()
+    task.cancel("first cancellation")
+    await asyncio.sleep(0)
+    task.cancel("second cancellation")
+    finish_rollback.set()
+    with pytest.raises(asyncio.CancelledError) as info:
+        await task
+    assert_cancellation_message(info.value, "first cancellation")
+    assert_read_write_lock_state(lock_file, "read", available=True)
+    await lock.acquire_write()
+    await lock.release()
+    await lock.close()
+
+
+@pytest.mark.asyncio
+async def test_release_cancellation_before_executor_start_commits(lock_file: str) -> None:
+    executor_started = threading.Event()
+    release_executor = threading.Event()
+    held = asyncio.Event()
+    start_release = asyncio.Event()
+    releasing = asyncio.Event()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        lock = AsyncReadWriteLock(lock_file, is_singleton=False, executor=executor)
+
+        async def hold_then_release() -> None:
+            await lock.acquire_write()
+            held.set()
+            await start_release.wait()
+            releasing.set()
+            await lock.release()
+
+        task = asyncio.create_task(hold_then_release())
+        await held.wait()
+        blocker = executor.submit(_block_executor, executor_started, release_executor)
+        assert executor_started.wait(timeout=5)
+        start_release.set()
+        await releasing.wait()  # the release is queued behind the blocker; the executor has not started it
+        task.cancel("cancel queued release")
+        release_executor.set()
+        blocker.result(timeout=5)
+        with pytest.raises(asyncio.CancelledError) as info:
+            await task
+        assert_cancellation_message(info.value, "cancel queued release")
+        assert_read_write_lock_state(lock_file, "read", available=True)
+        await lock.acquire_write()
+        await lock.release()
+        await lock.close()
+
+
+@pytest.mark.asyncio
+async def test_acquire_proceeds_after_queued_release_is_cancelled(lock_file: str, mocker: MockerFixture) -> None:
+    rollback_started = asyncio.Event()
+    finish_rollback = threading.Event()
+    _patch_async_rollback(mocker, asyncio.get_running_loop(), rollback_started, finish_rollback)
+    lock = AsyncReadWriteLock(lock_file, is_singleton=False)
+    acquired = asyncio.Event()
+
+    async def hold_then_release() -> None:
+        await lock.acquire_write()
+        await lock.release()
+
+    async def acquire_then_release() -> None:
+        await lock.acquire_write()
+        acquired.set()
+        await lock.release()
+
+    releaser = asyncio.create_task(hold_then_release())
+    await rollback_started.wait()
+    acquirer = asyncio.create_task(acquire_then_release())
+    await asyncio.sleep(0)  # the acquirer queues behind the in-flight release transition
+    releaser.cancel("cancel release")
+    finish_rollback.set()
+    with pytest.raises(asyncio.CancelledError):
+        await releaser
+    await asyncio.wait_for(acquired.wait(), timeout=5)
+    await acquirer
+    assert_read_write_lock_state(lock_file, "read", available=True)
+    await lock.close()
+
+
+@pytest.mark.asyncio
+async def test_backend_cancelled_release_keeps_the_hold(lock_file: str, mocker: MockerFixture) -> None:
+    backend_cancellation = asyncio.CancelledError("backend cancelled")
+    real_release = ReadWriteLock.release
+    fail_once = True
+
+    def flaky_release(self: ReadWriteLock, *, force: bool = False) -> None:
+        nonlocal fail_once
+        if fail_once:
+            fail_once = False
+            raise backend_cancellation
+        real_release(self, force=force)
+
+    mocker.patch.object(ReadWriteLock, "release", flaky_release)
+    lock = AsyncReadWriteLock(lock_file, is_singleton=False)
+    await lock.acquire_write()
+    with pytest.raises(asyncio.CancelledError) as info:
+        await lock.release()
+    assert info.value is backend_cancellation
+    # The backend never ran the release, so the hold survives for the retry to find.
+    assert_read_write_lock_state(lock_file, "read", available=False)
+    await lock.release()
+    assert_read_write_lock_state(lock_file, "read", available=True)
+    await lock.close()
+
+
 def _patch_async_rollback(
     mocker: MockerFixture,
     loop: asyncio.AbstractEventLoop,
