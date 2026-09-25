@@ -217,6 +217,13 @@ class _TaskOwners:
             mode = self._mode
         try:
             await leave()
+        except asyncio.CancelledError:
+            # The async wrappers drain the executor operation before letting caller cancellation through, so a
+            # cancelled release has still committed on the sync lock. Restoring the hold here would strand it: the
+            # task ends up recorded as holder of a lock nobody holds, blocking every later acquirer forever, and a
+            # retried release would roll back a lock a peer has since taken.
+            self._finish_transition(mode=None)
+            raise
         except BaseException:
             # The sync lock may still hold the transaction, so keep the hold for a retried release to find.
             self._finish_transition(mode=mode, holder=task)

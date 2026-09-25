@@ -4,6 +4,7 @@ import asyncio
 import logging
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from errno import EIO
 from typing import TYPE_CHECKING
 
@@ -50,6 +51,55 @@ async def test_release_completes_despite_cancellation(tmp_path: Path, mocker: Mo
     with pytest.raises(asyncio.CancelledError):
         await task
     assert (lock.is_locked, lock.lock_counter) == (False, 0)
+    assert_file_lock_state(str(tmp_path / "a"), available=True)
+
+
+@NEEDS_FCNTL
+@pytest.mark.asyncio  # pragma: needs fcntl
+@XFAIL_WITHOUT_COROUTINE_CANCELLATION
+async def test_release_repeated_cancellation_still_completes(tmp_path: Path, mocker: MockerFixture) -> None:
+    lock = AsyncFileLock(str(tmp_path / "a"))
+    await lock.acquire()
+    release_started = asyncio.Event()
+    finish_release = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def block_unlock(_fd: int, _operation: int) -> None:
+        loop.call_soon_threadsafe(release_started.set)
+        assert finish_release.wait(timeout=5)
+
+    mocker.patch("filelock._unix.fcntl.flock", side_effect=block_unlock)
+    task = asyncio.create_task(lock.release())
+    await release_started.wait()
+    task.cancel("first cancellation")
+    await asyncio.sleep(0)
+    task.cancel("second cancellation")
+    finish_release.set()
+    with pytest.raises(asyncio.CancelledError) as info:
+        await task
+    assert_cancellation_message(info.value, "first cancellation")
+    assert (lock.is_locked, lock.lock_counter) == (False, 0)
+    assert_file_lock_state(str(tmp_path / "a"), available=True)
+
+
+@pytest.mark.asyncio
+async def test_release_cancellation_before_executor_picks_it_up_commits(tmp_path: Path) -> None:
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        lock = AsyncFileLock(tmp_path / "a", executor=executor)
+        await lock.acquire()
+        blocker_started = threading.Event()
+        release_executor = threading.Event()
+        blocker = executor.submit(_block_executor, blocker_started, release_executor)
+        assert blocker_started.wait(timeout=5)
+        task = asyncio.create_task(lock.release())
+        await asyncio.sleep(0)  # let the release queue behind the blocker
+        task.cancel("cancel queued release")
+        release_executor.set()
+        with pytest.raises(asyncio.CancelledError) as info:
+            await task
+        assert_cancellation_message(info.value, "cancel queued release")
+        blocker.result(timeout=5)
+        assert (lock.is_locked, lock.lock_counter) == (False, 0)
     assert_file_lock_state(str(tmp_path / "a"), available=True)
 
 
@@ -232,3 +282,8 @@ async def test_context_chain_does_not_duplicate_body_already_in_release_group(tm
         (body_error,),
     )
     await lock.release()
+
+
+def _block_executor(executor_started: threading.Event, release_executor: threading.Event) -> None:
+    executor_started.set()
+    assert release_executor.wait(timeout=5)

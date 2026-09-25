@@ -239,7 +239,13 @@ class AsyncSoftReadWriteLock:
     async def close(self) -> None:
         """Release any held lock and release the underlying filesystem resources. Idempotent."""
         if self._creator_pid == os.getpid():
-            await self._run(self._lock.close)
+            try:
+                await self._run(self._lock.close)
+            except asyncio.CancelledError:
+                # _run drains the executor call before letting cancellation through, so the close committed; the
+                # task holds must not survive it.
+                self._owners.reset()
+                raise
             self._owners.reset()
 
     def _raise_if_inherited(self) -> None:

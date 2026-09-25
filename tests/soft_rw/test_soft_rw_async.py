@@ -338,7 +338,30 @@ async def test_async_release_cancellation_drains_the_release(tmp_path: Path, moc
     assert gate.finished.is_set(), "the cancellation surfaced while the release was still running"
     assert lock._lock._hold is None
     assert _members(tmp_path) == []
+    # The drained release committed, so the task hold must be gone with it: leaving it would strand the lock and
+    # block every later acquirer behind a holder that no longer exists.
+    assert (dict(lock._owners._depths), lock._owners._mode, lock._owners._transitioning) == ({}, None, False)
+    async with lock.write_lock(timeout=5):
+        pass
     await lock.close()
+
+
+@pytest.mark.asyncio
+@XFAIL_WITHOUT_COROUTINE_CANCELLATION
+async def test_async_close_cancellation_resets_the_task_holds(tmp_path: Path, mocker: MockerFixture) -> None:
+    lock = _make(tmp_path)
+    gate = _Gate(mocker, "close")
+    task = asyncio.create_task(_acquire_write_then_close(lock))
+    await gate.started.wait()
+    task.cancel("cancel close")
+    asyncio.get_running_loop().call_later(0.05, gate.resume)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert gate.finished.is_set(), "the cancellation surfaced while the close was still running"
+    assert lock._lock._hold is None
+    assert _members(tmp_path) == []
+    assert (dict(lock._owners._depths), lock._owners._mode) == ({}, None)
 
 
 @pytest.mark.asyncio
@@ -364,3 +387,8 @@ async def _acquire_write_then_release(lock: AsyncSoftReadWriteLock) -> None:
     # A hold belongs to the task that took it, so the task whose release gets canceled has to acquire first.
     await lock.acquire_write(timeout=5)
     await lock.release()
+
+
+async def _acquire_write_then_close(lock: AsyncSoftReadWriteLock) -> None:
+    await lock.acquire_write(timeout=5)
+    await lock.close()
