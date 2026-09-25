@@ -620,6 +620,10 @@ out of the snapshot, so its own timeout does not leave readers blocked. The next
 a holder that died on another host once ``stale_threshold`` has passed. Filesystem calls on an unresponsive
 network mount can still outlast the acquisition timeout.
 
+The acquisition deadline also covers the lock's internal state mutex: an acquisition never waits on it past its own
+timeout, and ``blocking=False`` raises :class:`~filelock.Timeout` immediately when another thread of this process
+holds it. The mutex only ever guards in-memory updates, so contention on it lasts moments.
+
 .. warning::
 
    ``SoftReadWriteLock`` and ``ReadWriteLock`` are singletons by default. A second construction for the same path

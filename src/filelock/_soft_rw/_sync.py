@@ -421,39 +421,38 @@ class SoftReadWriteLock(metaclass=_SoftRWMeta):
         timeout = self.timeout if timeout is None else timeout
         blocking = self.blocking if blocking is None else blocking
 
-        with self._locks.internal:
+        deadline = None if timeout == -1 else time.perf_counter() + timeout
+
+        with self._internal_state(deadline, blocking=blocking):
             if self._closed:
                 msg = f"SoftReadWriteLock on {self.lock_file} has been closed"
                 raise RuntimeError(msg)
             if self._hold is not None:
                 return self._validate_reentrant(mode)
 
-        start = time.perf_counter()
         if not blocking:
             acquired = self._locks.transaction.acquire(blocking=False)
-        elif timeout == -1:
+        elif deadline is None:
             acquired = self._locks.transaction.acquire(blocking=True)
         else:
-            acquired = self._locks.transaction.acquire(blocking=True, timeout=timeout)
+            acquired = self._locks.transaction.acquire(timeout=max(deadline - time.perf_counter(), 0.0))
         if not acquired:
             raise Timeout(self.lock_file) from None
         try:
-            return self._do_acquire_inner(mode, timeout, start, blocking=blocking)
+            return self._do_acquire_inner(mode, deadline, blocking=blocking)
         finally:
             self._locks.transaction.release()
 
     def _do_acquire_inner(
         self,
         mode: Mode,
-        effective_timeout: float,
-        start: float,
+        deadline: float | None,
         *,
         blocking: bool,
     ) -> AcquireReturnProxy:
-        with self._locks.internal:
+        with self._internal_state(deadline, blocking=blocking):
             if self._hold is not None:
                 return self._validate_reentrant(mode)
-        deadline = None if effective_timeout == -1 else start + effective_timeout
         participant = Participant(
             self._files,
             self._root,
@@ -464,15 +463,6 @@ class SoftReadWriteLock(metaclass=_SoftRWMeta):
             log=self._log,
         )
         participant.publish()
-        try:
-            self._wait_for(participant.advance, deadline=deadline, blocking=blocking)
-        except BaseException:
-            # A contender that gives up must not stay named in the snapshot: a writer left there would block every
-            # reader until a peer waits out the stale threshold. Its own token is all leave() touches, so it cannot
-            # undo a peer's claim.
-            with suppress(OSError):
-                participant.leave()
-            raise
         stop_event = threading.Event()
         hold = _Hold(
             level=1,
@@ -488,23 +478,55 @@ class SoftReadWriteLock(metaclass=_SoftRWMeta):
             heartbeat_stop=stop_event,
             last_refresh=time.monotonic(),
         )
+        try:
+            self._wait_for(participant.advance, deadline=deadline, blocking=blocking)
+            start_error = self._publish_hold(hold, deadline, blocking=blocking)
+        except BaseException:
+            # A contender that gives up must not stay named in the snapshot: a writer left there would block every
+            # reader until a peer waits out the stale threshold. Its own token is all leave() touches, so it cannot
+            # undo a peer's claim.
+            with suppress(OSError):
+                participant.leave()
+            raise
+        if start_error is not None:
+            participant.leave()
+            raise start_error
+        return AcquireReturnProxy(lock=self)
+
+    def _publish_hold(self, hold: _Hold, deadline: float | None, *, blocking: bool) -> BaseException | None:
         # Publish the hold and start its heartbeat under one internal-lock section, so a concurrent release() never
         # observes a hold whose thread has not started and joins it. If the OS refuses the thread, clear the hold and
         # leave: left in place, a peer evicts the unrefreshed record and acquires while this instance still believes it
         # holds the lock.
-        start_error: BaseException | None = None
-        with self._locks.internal:
+        with self._internal_state(deadline, blocking=blocking):
             self._hold = hold
             self._compromise = None
             try:
                 hold.heartbeat_thread.start()
             except BaseException as error:  # ruff:ignore[blind-except]  # clear the slot below and re-raise
                 self._hold = None
-                start_error = error
-        if start_error is not None:
-            participant.leave()
-            raise start_error
-        return AcquireReturnProxy(lock=self)
+                return error
+        return None
+
+    @contextmanager
+    def _internal_state(self, deadline: float | None, *, blocking: bool) -> Generator[None]:
+        """
+        The internal state lock, bounded by the acquisition *deadline*.
+
+        The lock only ever guards in-memory updates, so a peer thread holds it for moments at a time. An acquisition
+        still must not wait on it past its own deadline, or a peer stuck mid-update would park the caller beyond its
+        timeout.
+        """
+        if not self._locks.internal.acquire(blocking=False):
+            if not blocking:
+                raise Timeout(self.lock_file) from None
+            wait = -1 if deadline is None else max(deadline - time.perf_counter(), 0.0)
+            if not self._locks.internal.acquire(timeout=wait):
+                raise Timeout(self.lock_file) from None
+        try:
+            yield
+        finally:
+            self._locks.internal.release()
 
     def _validate_reentrant(self, mode: Mode) -> AcquireReturnProxy:
         hold = self._hold

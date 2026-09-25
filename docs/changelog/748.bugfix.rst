@@ -1,0 +1,2 @@
+Honor acquisition timeouts and ``blocking=False`` while a ``SoftReadWriteLock`` acquisition waits on the lock's
+internal state lock, which used to park the acquisition past its deadline.
