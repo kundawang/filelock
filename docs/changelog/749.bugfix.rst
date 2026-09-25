@@ -1,0 +1,1 @@
+``SoftFileLease``'s heartbeat reads its claim back and republishes it when the marker was left torn or unreadable, so a briefly corrupt marker heals on the next refresh instead of being evicted as malformed, and a transient error reading or repairing the marker is ridden out like any other transient refresh failure.

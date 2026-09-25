@@ -214,6 +214,95 @@ def test_lease_tolerates_a_transient_refresh_error(marker: Path, mocker: MockerF
         assert lease.compromise is None
 
 
+def test_lease_heartbeat_heals_a_torn_marker(marker: Path) -> None:
+    # A partial or foreign write leaves the marker unreadable to the lease parser. The heartbeat reads its claim
+    # back and republishes it, so a briefly corrupt marker heals instead of sitting malformed until a contender
+    # evicts the live claim over it.
+    lease = _lease(marker)
+    with lease:
+        token = lease.token
+        marker.write_text("filelock/2\npid=12", encoding="utf-8")  # a torn record on the same inode
+        time.sleep(_HEARTBEAT * 5)
+
+        assert lease.compromise is None
+        owner = lease.owner
+        assert owner is not None
+        assert (owner.token, owner.lease_duration) == (token, _DURATION)
+        with pytest.raises(Timeout):
+            _lease(marker).acquire()  # the healed marker still excludes contenders
+
+
+def test_lease_tolerates_a_transient_marker_read_error(marker: Path, mocker: MockerFixture) -> None:
+    # A transient EIO reading the claim back fails the tick, not the claim: the next tick reads it whole again.
+    import filelock._lease as lease_mod
+
+    ticks = itertools.count()
+    real_read = cast("Callable[..., tuple[str | None, float, int]]", lease_mod._read_lock_file)
+
+    def flaky(path: str, *args: object, **kwargs: object) -> tuple[str | None, float, int]:
+        if str(path).endswith(marker.name) and next(ticks) < 2:
+            raise OSError(EIO, "Input/output error")
+        return real_read(path, *args, **kwargs)
+
+    mocker.patch("filelock._lease._read_lock_file", side_effect=flaky)
+    seen: list[LeaseCompromise] = []
+    lease = _lease(marker, on_compromise=seen.append)
+    with lease:
+        time.sleep(_HEARTBEAT * 6)  # several ticks: the first two fail the read, the rest recover
+        assert seen == []
+        assert lease.compromise is None
+        assert lease.owner is not None
+
+
+def test_lease_tolerates_a_transient_repair_failure(marker: Path, mocker: MockerFixture) -> None:
+    # The first republish of a torn marker fails transiently; a later tick heals it without a compromise.
+    import filelock._lease as lease_mod
+
+    writes = itertools.count()
+    real_write_all = lease_mod.write_all
+
+    def flaky_write(fd: int, data: bytes) -> None:
+        if next(writes) < 1:
+            raise OSError(EIO, "Input/output error")
+        real_write_all(fd, data)
+
+    mocker.patch("filelock._lease.write_all", side_effect=flaky_write)
+    seen: list[LeaseCompromise] = []
+    lease = _lease(marker, on_compromise=seen.append)
+    with lease:
+        token = lease.token
+        marker.write_text("filelock/2\npid=12", encoding="utf-8")
+        time.sleep(_HEARTBEAT * 6)  # the first repair fails, a later tick heals the marker
+        assert seen == []
+        assert lease.compromise is None
+        owner = lease.owner
+        assert owner is not None
+        assert owner.token == token
+
+
+def test_lease_leaves_a_marker_read_from_another_inode_alone(marker: Path, mocker: MockerFixture) -> None:
+    # The path changed hands between the refresh stat and the read-back, so the record read names a peer's marker.
+    # The heal leaves it alone; the next stat reports the takeover.
+    lease = _lease(marker)
+    republish = mocker.patch.object(lease, "_republish_marker")
+    mocker.patch("filelock._lease._read_lock_file", return_value=(None, 0.0, -1))
+
+    lease._heal_marker((0, 1), "token")
+
+    republish.assert_not_called()
+
+
+def test_lease_does_not_repair_over_a_replaced_marker(marker: Path) -> None:
+    # The path changed hands between the read-back and the republish: the fresh descriptor names a peer's inode,
+    # so the rewrite is refused rather than stamped over the peer's claim.
+    lease = _lease(marker)
+    marker.write_text("a peer's marker\n", encoding="utf-8")
+
+    lease._republish_marker((0, 1), "token")  # an identity nothing at the path can match
+
+    assert marker.read_text(encoding="utf-8") == "a peer's marker\n"
+
+
 @NEEDS_UNLINK_OPEN_FILE
 def test_lease_reports_one_compromise_per_claim(marker: Path) -> None:  # pragma: needs unlink-open-file
     seen: list[LeaseCompromise] = []

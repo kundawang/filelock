@@ -11,9 +11,9 @@ from typing import TYPE_CHECKING, Literal
 
 from ._error import LeaseSettingsMismatch
 from ._identity import owner_is_stale
-from ._marker import MarkerSoftFileLock, OwnerMode, OwnerRecord, parse_marker
+from ._marker import MarkerSoftFileLock, OwnerMode, OwnerRecord, encode_marker, parse_marker
 from ._soft import _read_lock_file
-from ._util import break_lock_file, touch
+from ._util import break_lock_file, touch, write_all
 
 if TYPE_CHECKING:
     import sys
@@ -79,9 +79,11 @@ class SoftFileLease(MarkerSoftFileLock):
     Existence lock whose claim expires, so a peer may take it while the previous holder still runs.
 
     A lease trades mutual exclusion for progress. The holder publishes a claim and refreshes it every
-    ``heartbeat_interval`` seconds; a contender takes the marker once it is ``lease_duration`` seconds stale. Nothing
-    stops the expired holder: it keeps running, and it keeps using whatever the lock protects. Treat the lease as a hint
-    about who *should* be working, not as a guarantee that only one worker is.
+    ``heartbeat_interval`` seconds; a contender takes the marker once it is ``lease_duration`` seconds stale. Each
+    refresh also reads the claim back and republishes it when the marker was left torn or unreadable, so a briefly
+    corrupt marker heals instead of being evicted as malformed. Nothing stops the expired holder: it keeps running,
+    and it keeps using whatever the lock protects. Treat the lease as a hint about who *should* be working, not as a
+    guarantee that only one worker is.
 
     To make a protected resource reject a superseded holder, that resource must be linearizable and must fence on a
     monotonic generation it controls. :attr:`token` names a claim; it does not fence one. Where overlap is unacceptable,
@@ -320,10 +322,50 @@ class SoftFileLease(MarkerSoftFileLock):
             self._report_compromise(claim, "owner-changed", None, token)
             return "lost", None
         try:
+            self._heal_marker(identity, token)
             touch(self.lock_file, fd=fd)
         except OSError as error:
             return "transient", error
         return "ok", None
+
+    def _heal_marker(self, identity: tuple[int, int], token: str) -> None:
+        # Read the claim back and republish it when the marker no longer names it whole. A torn or foreign write
+        # leaves content the lease parser cannot read, which every contender then treats as a malformed marker and
+        # evicts once it ages past the grace window, taking a live claim down with it. A failed read is transient,
+        # not a loss: the caller retries it on the next tick. A record read from an inode other than the one this
+        # claim published means the path changed hands mid-tick, so leave it alone and let the next stat report
+        # the takeover rather than repair over a peer's marker.
+        content, _, ino = _read_lock_file(self.lock_file)
+        if ino != identity[1]:
+            return
+        if (owner := parse_marker(content)) is not None and owner == self._claim_record(token):
+            return
+        self._republish_marker(identity, token)
+
+    def _republish_marker(self, identity: tuple[int, int], token: str) -> None:
+        # Rewrite the whole claim onto the inode this claim published, re-verified on a fresh descriptor. Neither
+        # the descriptor the heartbeat was handed (a racing release may already have closed it, and the number may
+        # name an unrelated file by now) nor the pathname (it may have changed hands since the stat above) is
+        # trusted with the write on its own.
+        fd = os.open(
+            self.lock_file,
+            os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+        )
+        try:
+            st = os.fstat(fd)
+            if (st.st_dev, st.st_ino) != identity:
+                return
+            record = encode_marker(self._claim_record(token))
+            os.lseek(fd, 0, os.SEEK_SET)
+            write_all(fd, record)
+            os.ftruncate(fd, len(record))
+        finally:
+            os.close(fd)
+
+    def _claim_record(self, token: str) -> OwnerRecord:
+        # The heartbeat thread cannot read the claim on a thread-local context, so the record a repair republishes
+        # takes the token the thread was handed; every other field of the published record is process-wide.
+        return self._published_record()._replace(token=token)
 
     def _report_compromise(
         self,
