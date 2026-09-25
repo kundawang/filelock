@@ -48,6 +48,11 @@ class SoftFileLock(BaseFileLock):
     #: An existence lock keeps protocol state in its marker, so it cannot lend the descriptor to an on_acquired hook.
     _on_acquired_supported: bool = False
 
+    #: Seconds an unreadable marker must age before a contender evicts it as abandoned garbage rather than leave it
+    #: as a half-written fresh lock. A subclass whose holder refreshes its marker (the lease) widens the window to
+    #: its own refresh cycle, so a live holder's corrupt marker is never evicted between two heartbeats.
+    _malformed_lock_age_threshold: float = _MALFORMED_LOCK_AGE_THRESHOLD
+
     def _acquire(self) -> None:
         raise_on_not_writable_file(self.lock_file)
         ensure_directory_exists(self.lock_file)
@@ -96,7 +101,7 @@ class SoftFileLock(BaseFileLock):
                 # Unparsable: wrong line count, a non-integer PID or start token, empty, oversized or not UTF-8.
                 # Self-heal only once the file is clearly not a half-written fresh lock (a peer between O_EXCL and
                 # _write_lock_info), so the brief create-then-write window is never mistaken for a stale lock.
-                if time.time() - mtime >= _MALFORMED_LOCK_AGE_THRESHOLD:
+                if time.time() - mtime >= self._malformed_lock_age_threshold:
                     break_lock_file(self.lock_file, mtime, ino)
                 return
 

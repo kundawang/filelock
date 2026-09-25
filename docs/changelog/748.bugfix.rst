@@ -1,0 +1,2 @@
+``SoftFileLease`` republishes its claim when the heartbeat finds the marker torn, so a half-written or corrupted marker heals on the next refresh instead of wedging every contender or costing a live holder its lease.
+A lease contender also waits out a corrupt marker for the lease duration before evicting it, so a live holder is never superseded between two heartbeats.

@@ -11,9 +11,9 @@ from typing import TYPE_CHECKING, Literal
 
 from ._error import LeaseSettingsMismatch
 from ._identity import owner_is_stale
-from ._marker import MarkerSoftFileLock, OwnerMode, OwnerRecord, parse_marker
-from ._soft import _read_lock_file
-from ._util import break_lock_file, touch
+from ._marker import MarkerSoftFileLock, OwnerMode, OwnerRecord, encode_marker, parse_marker
+from ._soft import _MALFORMED_LOCK_AGE_THRESHOLD, _read_lock_file
+from ._util import break_lock_file, touch, write_all
 
 if TYPE_CHECKING:
     import sys
@@ -49,6 +49,16 @@ class _Heartbeat:
 
     thread: Thread
     stop: Event
+
+
+@dataclass(frozen=True)
+class _RefreshTarget:
+    """What one heartbeat refreshes: the descriptor, the inode it verified, and the record it published."""
+
+    fd: int
+    identity: tuple[int, int]
+    token: str
+    record: bytes
 
 
 @dataclass
@@ -200,7 +210,10 @@ class SoftFileLease(MarkerSoftFileLock):
         if (fd := self._context.lock_file_fd) is not None and (
             identity := self._context.lock_file_fd_identity
         ) is not None:
-            self._start_heartbeat(claim, fd, identity, token)
+            target = _RefreshTarget(
+                fd=fd, identity=identity, token=token, record=encode_marker(self._published_record())
+            )
+            self._start_heartbeat(claim, target)
         else:
             claim.token = None
 
@@ -211,6 +224,13 @@ class SoftFileLease(MarkerSoftFileLock):
 
     def _published_record(self) -> OwnerRecord:
         return super()._published_record()._replace(token=self._claim.token, lease_duration=self._lease_duration)
+
+    @property
+    def _malformed_lock_age_threshold(self) -> float:
+        # A corrupt marker a live holder's next heartbeat rewrites must never read as abandoned garbage, and an
+        # abandoned one is reclaimable on the same schedule as a readable expired claim, so the grace window
+        # covers the whole lease rather than the protocol 1 create-then-write window alone.
+        return max(_MALFORMED_LOCK_AGE_THRESHOLD, self._lease_duration)
 
     def _try_break_stale_lock(self) -> None:
         if (peer := self._read_peer()) is None:
@@ -249,13 +269,13 @@ class SoftFileLease(MarkerSoftFileLock):
                 return owner, mtime, ino
         return None
 
-    def _start_heartbeat(self, claim: _LeaseClaim, fd: int, identity: tuple[int, int], token: str) -> None:
+    def _start_heartbeat(self, claim: _LeaseClaim, target: _RefreshTarget) -> None:
         # The thread watches the event it was handed rather than whatever the claim names later: a heartbeat that
         # outlives its join timeout would otherwise adopt the next acquisition's event and never stop.
         stop = Event()
         thread = Thread(
             target=self._refresh_until_stopped,
-            args=(claim, fd, identity, token, stop),
+            args=(claim, target, stop),
             name=f"filelock-lease-{os.getpid()}",
             daemon=True,
         )
@@ -277,14 +297,7 @@ class SoftFileLease(MarkerSoftFileLock):
         if heartbeat.thread.ident is not None and heartbeat.thread is not current_thread():
             heartbeat.thread.join(timeout=self._heartbeat_interval)
 
-    def _refresh_until_stopped(
-        self,
-        claim: _LeaseClaim,
-        fd: int,
-        identity: tuple[int, int],
-        token: str,
-        stop: Event,
-    ) -> None:
+    def _refresh_until_stopped(self, claim: _LeaseClaim, target: _RefreshTarget, stop: Event) -> None:
         # The loop ends at the first loss of the claim, so the holder hears about it once. A transient filesystem
         # error (ESTALE / EIO on the NFS-style filesystems a lease targets) is not a loss: retry rather than raise a
         # false compromise. Report the claim unrefreshable only once failures have run long enough that a contender
@@ -292,38 +305,45 @@ class SoftFileLease(MarkerSoftFileLock):
         # restic declares a lock unrefreshable ahead of its stale time.
         last_success = time.monotonic()
         while not stop.wait(self._heartbeat_interval):
-            outcome, error = self._refresh_claim(claim, fd, identity, token)
+            outcome, error = self._refresh_claim(claim, target)
             if outcome == "lost":
                 return
             if outcome == "ok":
                 last_success = time.monotonic()
             elif time.monotonic() - last_success >= self._lease_duration - self._heartbeat_interval:
-                self._report_compromise(claim, "refresh-failed", error, token)
+                self._report_compromise(claim, "refresh-failed", error, target.token)
                 return
 
-    def _refresh_claim(
-        self,
-        claim: _LeaseClaim,
-        fd: int,
-        identity: tuple[int, int],
-        token: str,
-    ) -> tuple[_RefreshOutcome, OSError | None]:
+    def _refresh_claim(self, claim: _LeaseClaim, target: _RefreshTarget) -> tuple[_RefreshOutcome, OSError | None]:
         try:
             st = os.lstat(self.lock_file)
         except FileNotFoundError as error:
-            self._report_compromise(claim, "marker-missing", error, token)
+            self._report_compromise(claim, "marker-missing", error, target.token)
             return "lost", None
         except OSError as error:
             return "transient", error
         # A peer that took the expired claim replaced the marker, so the pathname now names its inode, not ours.
-        if (st.st_dev, st.st_ino) != identity:
-            self._report_compromise(claim, "owner-changed", None, token)
+        if (st.st_dev, st.st_ino) != target.identity:
+            self._report_compromise(claim, "owner-changed", None, target.token)
             return "lost", None
         try:
-            touch(self.lock_file, fd=fd)
+            self._restore_record(target)
+            touch(self.lock_file, fd=target.fd)
         except OSError as error:
             return "transient", error
         return "ok", None
+
+    def _restore_record(self, target: _RefreshTarget) -> None:
+        # The inode is ours, but its content may be torn: a crash mid-publish or a foreign writer leaves a marker
+        # no contender can parse, which a contender would evict as abandoned garbage once it aged past the grace
+        # window. Republish the claim rather than let the marker stay corrupt. The fd is write-only, so the check
+        # reads by path; the repair writes through the verified fd, so a path swapped in after the lstat cannot
+        # redirect it onto a peer's file.
+        if _read_lock_file(self.lock_file)[0] == target.record.decode("utf-8"):
+            return
+        os.lseek(target.fd, 0, os.SEEK_SET)
+        write_all(target.fd, target.record)
+        os.ftruncate(target.fd, len(target.record))
 
     def _report_compromise(
         self,

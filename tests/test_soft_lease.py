@@ -137,6 +137,60 @@ def test_lease_self_heals_a_malformed_marker(marker: Path) -> None:
         assert lease.is_lock_held_by_us
 
 
+def test_lease_leaves_a_fresh_malformed_marker_for_its_holder(marker: Path) -> None:
+    # A corrupt marker younger than the lease may be a live holder's between two heartbeats, so a contender waits
+    # rather than evict it; only aging past the lease itself makes it abandoned garbage.
+    marker.write_text("not a protocol 2 record\n", encoding="utf-8")
+    stale = time.time() - 3  # past the protocol 1 malformed grace, nowhere near the lease duration
+    os.utime(marker, (stale, stale))
+    lease = SoftFileLease(str(marker), timeout=0.3, lease_duration=60.0, heartbeat_interval=_HEARTBEAT)
+
+    with pytest.raises(Timeout):
+        lease.acquire()
+
+    assert marker.read_text(encoding="utf-8") == "not a protocol 2 record\n"
+
+
+def test_lease_heartbeat_republishes_a_torn_marker(marker: Path) -> None:
+    # A marker torn after publish (a crash mid-write, a foreign writer) reads as malformed to every contender.
+    # The holder's heartbeat notices the content no longer names its claim and republishes it, so the corruption
+    # neither sticks nor costs the holder its lease.
+    seen: list[LeaseCompromise] = []
+    lease = _lease(marker, on_compromise=seen.append)
+
+    with lease:
+        published = marker.read_text(encoding="utf-8")
+        marker.write_text("filelock/2\npid=12", encoding="utf-8")  # a truncated record
+        deadline = time.monotonic() + _HEARTBEAT * 50
+        while marker.read_text(encoding="utf-8") != published and time.monotonic() < deadline:
+            time.sleep(_HEARTBEAT)
+        assert marker.read_text(encoding="utf-8") == published
+        time.sleep(_HEARTBEAT * 3)  # a few more ticks: the healed marker raises no compromise
+        assert seen == []
+        assert lease.compromise is None
+        assert lease.is_lock_held_by_us
+
+
+def test_lease_contender_cannot_evict_a_live_holders_torn_marker(marker: Path) -> None:
+    # A heartbeat slower than the protocol 1 malformed grace leaves a corrupt marker aged past it between two
+    # refreshes. The lease widens the grace to its duration, so the contender waits out the holder's next refresh
+    # (which republishes the claim) instead of evicting a live holder and overlapping with it.
+    seen: list[LeaseCompromise] = []
+    holder = SoftFileLease(
+        str(marker), timeout=0.3, lease_duration=6.0, heartbeat_interval=3.0, on_compromise=seen.append
+    )
+    holder.acquire()
+    try:
+        marker.write_text("filelock/2\npid=12", encoding="utf-8")
+        contender = SoftFileLease(str(marker), timeout=4.0, lease_duration=6.0, heartbeat_interval=3.0)
+        with pytest.raises(Timeout):
+            contender.acquire()
+        assert holder.compromise is None
+    finally:
+        holder.release()
+    assert seen == []
+
+
 def test_lease_reclaims_a_dead_same_host_holder(marker: Path) -> None:
     marker.write_text(
         f"filelock/2\npid=999999\nhost={socket.gethostname()}\nmode=lease\ntoken=abc\nduration={_DURATION!r}\n",
@@ -191,14 +245,24 @@ def test_lease_reports_compromise_when_a_refresh_fails(marker: Path, mocker: Moc
     assert [(c.reason, c.error) for c in seen] == [("refresh-failed", failure)]
 
 
-@pytest.mark.parametrize("target", [pytest.param("touch", id="touch"), pytest.param("os.lstat", id="lstat")])
+@pytest.mark.parametrize(
+    "target",
+    [
+        pytest.param("touch", id="touch"),
+        pytest.param("os.lstat", id="lstat"),
+        pytest.param("_read_lock_file", id="read"),
+    ],
+)
 def test_lease_tolerates_a_transient_refresh_error(marker: Path, mocker: MockerFixture, target: str) -> None:
     # A transient ESTALE/EIO on the refresh path that recovers before the lease could lapse must not raise a
     # compromise: the marker was ours last tick, so retry rather than tell the holder to abandon its work.
     import filelock._lease as lease_mod
 
     ticks = itertools.count()
-    real = cast("Callable[..., object]", lease_mod.touch if target == "touch" else os.lstat)
+    real = cast(
+        "Callable[..., object]",
+        {"touch": lease_mod.touch, "os.lstat": os.lstat, "_read_lock_file": lease_mod._read_lock_file}[target],
+    )
 
     def flaky(path: str, *args: object, **kwargs: object) -> object:
         if path.endswith(marker.name) and next(ticks) < 2:
